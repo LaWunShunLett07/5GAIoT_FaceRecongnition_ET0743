@@ -1,7 +1,6 @@
-# recognition.py
-# Recognize faces (Amy, Shun, Shafiqa, etc.) already registered in CodeProject.AI
-# Controls:
-#   q = quit
+# recognition.py (MULTI-FACE)
+# Recognize multiple faces in one frame using CodeProject.AI
+# q = quit
 
 import os
 import cv2
@@ -12,30 +11,27 @@ from imutils.video import VideoStream
 
 opts = Options()
 rtsp_url = "rtsp://169.254.15.175:8554/feeder"
-# ✅ Fix imageDir empty issue
+# Fix imageDir empty issue
 if not getattr(opts, "imageDir", "") or opts.imageDir.strip() == "":
     opts.imageDir = "images"
 os.makedirs(opts.imageDir, exist_ok=True)
 
-# Tuning
 SKIP_FRAME = 5
-MIN_RECOG_CONFIDENCE = 0.60  # increase to 0.70–0.85 if mislabels still happen
+MIN_RECOG_CONFIDENCE = 0.70   # raise to 0.80 if mislabels happen
 
-def recognize_face(img_path: str) -> dict:
-    """Send an image (inside opts.imageDir) to CodeProject.AI for recognition."""
-    filepath = os.path.join(opts.imageDir, img_path)
-
-    with open(filepath, "rb") as f:
-        image_data = f.read()
-
+def recognize_face_bytes(image_bytes: bytes) -> dict:
+    """Send bytes (cropped face) to server for recognition."""
     try:
         return requests.post(
             opts.endpoint("vision/face/recognize"),
-            files={"image": image_data},
+            files={"image": image_bytes},
             data={"min_confidence": MIN_RECOG_CONFIDENCE}
         ).json()
     except requests.exceptions.RequestException as e:
         raise SystemExit(e)
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 def main():
     cap = VideoStream(rtsp_url).start()
@@ -56,16 +52,16 @@ def main():
         if SKIP_FRAME > 1 and (frame_index % SKIP_FRAME != 0):
             continue
 
-        # Keep a clean copy for recognition (no rectangles/text drawn)
         raw_frame = frame.copy()
+        h, w = raw_frame.shape[:2]
 
-        # Timestamp overlay (display only)
+        # Timestamp (display)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cv2.putText(frame, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                     1, (0, 255, 0), 1, cv2.LINE_AA)
 
-        # Detect faces (bounding boxes)
-        ok, new_frame = cv2.imencode(".jpg", raw_frame)
+        # Detect faces (get bounding boxes)
+        ok, jpg = cv2.imencode(".jpg", raw_frame)
         if not ok:
             cv2.imshow("Image Viewer", frame)
             continue
@@ -73,52 +69,64 @@ def main():
         try:
             detect_resp = requests.post(
                 opts.endpoint("vision/face"),
-                files={"image": new_frame}
+                files={"image": jpg}
             ).json()
         except requests.exceptions.RequestException as e:
             raise SystemExit(e)
 
         detections = detect_resp.get("predictions", [])
-        num_faces = len(detections)
 
-        if num_faces >= 1:
-            # Save the clean frame for recognition
-            save_path = os.path.join(opts.imageDir, "image.jpg")
-            cv2.imwrite(save_path, raw_frame)
+        if len(detections) == 0:
+            cv2.putText(frame, "No face detected", (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.imshow("Image Viewer", frame)
+            continue
 
-            # Recognize (who is it?)
-            result = recognize_face("image.jpg")
-            recog_list = result.get("predictions", [])
+        # For each detected face -> crop -> recognize -> label
+        for d in detections:
+            x1 = clamp(int(d["x_min"]), 0, w - 1)
+            y1 = clamp(int(d["y_min"]), 0, h - 1)
+            x2 = clamp(int(d["x_max"]), 0, w - 1)
+            y2 = clamp(int(d["y_max"]), 0, h - 1)
 
-            # Draw boxes and label each detection with the best match (if any)
-            # If CodeProject.AI returns multiple predictions, we take the top one.
-            best_userid = "Unknown"
-            best_conf = 0.0
-            if len(recog_list) > 0:
-                top = recog_list[0]
-                best_userid = top.get("userid", "Unknown")
-                best_conf = float(top.get("confidence", top.get("score", 0.0)) or 0.0)
+            # Add padding (helps recognition)
+            pad = 20
+            x1p = clamp(x1 - pad, 0, w - 1)
+            y1p = clamp(y1 - pad, 0, h - 1)
+            x2p = clamp(x2 + pad, 0, w - 1)
+            y2p = clamp(y2 + pad, 0, h - 1)
 
-            for d in detections:
-                x1, y1, x2, y2 = d["x_min"], d["y_min"], d["x_max"], d["y_max"]
+            face_crop = raw_frame[y1p:y2p, x1p:x2p]
 
-                # Draw rectangle
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            # If crop too small, skip
+            if face_crop.size == 0 or (x2p - x1p) < 40 or (y2p - y1p) < 40:
+                continue
 
-                # Label logic
-                if best_userid and str(best_userid).lower() != "unknown" and best_conf >= MIN_RECOG_CONFIDENCE:
-                    label = f"{best_userid} ({best_conf:.2f})"
-                    print(f"Recognized as: {best_userid} (confidence={best_conf:.2f})")
-                else:
-                    label = "Unknown"
-                    # (optional) print only sometimes to reduce spam
-                    print("No confident match")
+            # Encode crop to jpg bytes
+            ok2, face_jpg = cv2.imencode(".jpg", face_crop)
+            if not ok2:
+                continue
 
-                cv2.putText(frame, label, (x1, max(20, y1 - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            # Recognize this face
+            result = recognize_face_bytes(face_jpg.tobytes())
+            preds = result.get("predictions", [])
 
-        else:
-            print("Make sure you are showing your face CLEARLY...")
+            # Default label
+            label = "Unknown"
+            conf = 0.0
+
+            if len(preds) > 0:
+                top = preds[0]
+                userid = top.get("userid", "unknown")
+                conf = float(top.get("confidence", top.get("score", 0.0)) or 0.0)
+
+                if userid and str(userid).lower() != "unknown" and conf >= MIN_RECOG_CONFIDENCE:
+                    label = f"{userid} ({conf:.2f})"
+
+            # Draw rectangle + label for THIS face only
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame, label, (x1, max(20, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
 
         cv2.imshow("Image Viewer", frame)
 
