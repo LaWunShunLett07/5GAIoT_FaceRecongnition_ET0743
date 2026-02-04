@@ -1,7 +1,7 @@
 import serial
 import time
 # Configure the serial connection, chnage the COM port accordingly
-ser = serial.Serial('COM10', 115200, timeout=1)
+ser = serial.Serial('COM9', 115200, timeout=1)
 # Wait for the device to initialize
 time.sleep(2)
 # Send an AT command and wait for a response
